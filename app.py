@@ -10,6 +10,7 @@ import torchvision.transforms as T
 import cv2
 import requests
 import base64
+import gc
 from PIL import Image, ImageEnhance, ImageDraw
 from io import BytesIO
 from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
@@ -20,7 +21,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 # [0] 환경 설정
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# --- [1] 유틸리티 및 데이터 로드 ---
+# --- [1] 리소스 로드 (속도 최적화 유지) ---
 def get_direct_url(url):
     if not url or str(url) == 'nan' or 'drive.google.com' not in url: return url
     if 'file/d/' in url: file_id = url.split('file/d/')[1].split('/')[0]
@@ -28,6 +29,7 @@ def get_direct_url(url):
     else: return url
     return f'https://drive.google.com/uc?export=download&id={file_id}'
 
+@st.cache_data(ttl=3600)
 def get_image_as_base64(url):
     try:
         r = requests.get(get_direct_url(url), timeout=10)
@@ -54,9 +56,7 @@ def init_resources():
     model_dino.eval()
     with open('material_features.pkl', 'rb') as f:
         feature_db = pickle.load(f)
-    df_path = load_csv_smart('이미지경로.csv')
-    df_info = load_csv_smart('품목정보.csv')
-    df_stock = load_csv_smart('현재고.csv')
+    df_path = load_csv_smart('이미지경로.csv'); df_info = load_csv_smart('품목정보.csv'); df_stock = load_csv_smart('현재고.csv')
     agg_stock, stock_date = {}, "확인불가"
     if not df_stock.empty:
         df_stock['재고수량'] = pd.to_numeric(df_stock['재고수량'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
@@ -72,36 +72,7 @@ dino_transform = T.Compose([
     T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-@st.cache_data
-def get_master_map():
-    mapping = {}
-    for _, row in df_info.iterrows():
-        f = str(row.get('상품코드', '')).strip()
-        n = str(row.get('상품명', '')).strip()
-        d = get_digits(f)
-        if d: mapping[d] = {'formal': f, 'name': n}
-    return mapping
-
-master_map = get_master_map()
-
-# --- [2] 이미지 처리 엔진 ---
-def apply_advanced_correction(img, angle, bri, con, shp, sat, temp, exp, hue):
-    if angle != 0: img = img.rotate(angle, expand=True)
-    img = ImageEnhance.Brightness(img).enhance(bri)
-    img = ImageEnhance.Contrast(img).enhance(con)
-    img = ImageEnhance.Sharpness(img).enhance(shp)
-    img = ImageEnhance.Color(img).enhance(sat)
-    img_np = np.array(img).astype(np.float32)
-    img_np *= exp
-    if temp > 1.0: img_np[:, :, 0] *= temp; img_np[:, :, 2] /= temp
-    elif temp < 1.0: img_np[:, :, 2] *= (2.0-temp); img_np[:, :, 0] /= (2.0-temp)
-    img_np = np.clip(img_np, 0, 255).astype(np.uint8)
-    if hue != 0:
-        hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV).astype(np.float32)
-        hsv[:, :, 0] = (hsv[:, :, 0] + hue) % 180
-        img_np = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-    return Image.fromarray(img_np)
-
+# --- [2] 이미지 처리 엔진 (95도 회전 적용) ---
 def four_point_transform(image, pts):
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1); rect[0] = pts[np.argmin(s)]; rect[2] = pts[np.argmax(s)]
@@ -113,7 +84,7 @@ def four_point_transform(image, pts):
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (w, h), flags=cv2.INTER_LANCZOS4)
 
-# --- [3] Deco Finder v3.9 UI ---
+# --- [3] Deco Finder v3.9.2 UI ---
 st.set_page_config(layout="wide", page_title="Deco Finder")
 
 st.markdown("""
@@ -127,59 +98,50 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# [수정 1] 로고 제거 및 제목만 노출
+# [수정 1] 로고 제거
 st.title("Deco Finder")
-st.caption("Advanced Surface Pattern Matching System")
 
-if 'res_all' not in st.session_state: st.session_state['res_all'] = []
-if 'res_stock' not in st.session_state: st.session_state['res_stock'] = []
-if 'points' not in st.session_state: st.session_state['points'] = []
-if 'search_done' not in st.session_state: st.session_state['search_done'] = False
-if 'refresh_count' not in st.session_state: st.session_state['refresh_count'] = 0
+if 'res_all' not in st.session_state: st.session_state.update({'res_all': [], 'res_stock': [], 'points': [], 'search_done': False, 'refresh_count': 0})
 
-if st.sidebar.button("🔄 전체 초기화 (Reset All)", use_container_width=True):
+if st.sidebar.button("🔄 전체 초기화", use_container_width=True):
     for key in list(st.session_state.keys()): del st.session_state[key]
     st.session_state.update({'res_all': [], 'res_stock': [], 'points': [], 'search_done': False, 'refresh_count': 0})
-    st.rerun()
+    gc.collect(); st.rerun()
 
-st.sidebar.markdown(f"📦 **재고 정산 기준일:** \n{stock_date}")
+st.sidebar.markdown(f"📦 **재고 정산일:** \n{stock_date}")
 
-uploaded = st.file_uploader("📸 자재 사진 업로드 (Upload Image)", type=['jpg','png','jpeg'])
+uploaded = st.file_uploader("📸 자재 사진 업로드", type=['jpg','png','jpeg'])
 
 if uploaded:
     if 'current_img_name' not in st.session_state or st.session_state['current_img_name'] != uploaded.name:
         st.session_state.update({'points': [], 'search_done': False, 'res_all': [], 'res_stock': [], 'current_img_name': uploaded.name, 'proc_img': Image.open(uploaded).convert('RGB')})
-        st.rerun()
+        gc.collect(); st.rerun()
 
     working_img = st.session_state['proc_img']
     w, h = working_img.size
 
-    with st.expander("🛠️ 고급 이미지 보정 및 회전 (Advanced Settings)", expanded=False):
-        c_rot1, c_rot2 = st.columns([3, 1])
-        with c_rot1: angle = st.slider("사진 회전", 0, 360, value=st.session_state.get('angle_val', 0))
-        with c_rot2: angle = st.number_input("각도", 0, 360, value=angle, step=1)
-        st.session_state['angle_val'] = angle
-        c1, c2, c3 = st.columns(3)
-        with c1: bri = st.slider("밝기", 0.5, 2.0, 1.0); con = st.slider("대비", 0.5, 2.0, 1.0)
-        with c2: sat = st.slider("채도", 0.0, 2.0, 1.0); shp = st.slider("선명도", 0.0, 3.0, 1.5)
-        with c3: exp = st.slider("노출", 0.5, 2.0, 1.0); temp = st.slider("색온도", 0.5, 1.5, 1.0); hue = st.slider("색조", 0, 180, 0)
-
-    # [수정 2] 기본 사이즈를 0.5(50%)로 설정
-    scale = st.radio("🔍 보기 크기 (View Scale):", [0.1, 0.3, 0.5, 0.7, 1.0], index=2, horizontal=True)
+    # [수정 2] 기본 사이즈 0.5 고정 및 회전 버튼 대체
+    scale = st.radio("🔍 보기 크기:", [0.1, 0.3, 0.5, 0.7, 1.0], index=2, horizontal=True)
     
     col_ui, col_pad = st.columns([1, 2])
     with col_ui:
         source_type = st.radio("자재 출처", ['📸 촬영', '💻 디지털'], horizontal=True)
         mat_type = st.selectbox("자재 분류", ['일반', '우드', '유광', '패브릭', '석재'])
         s_mode = st.radio("분석 모드", ["종합(컬러+패턴)", "패턴 중심(흑백)"], horizontal=True)
+        
         c_btn1, c_btn2 = st.columns(2)
         with c_btn1:
-            # [수정 3] 이미지 새로고침 시 배율을 0.5로 강제 고정하도록 로직 연동
-            if st.button("🔄 이미지 새로고침", use_container_width=True): 
-                st.session_state['refresh_count'] += 1
-                st.rerun()
+            # [수정 3] 이미지 새로고침 버튼 -> 배율 0.5 초기화 기능 통합
+            if st.button("🔄 이미지 새로고침", use_container_width=True):
+                st.session_state['refresh_count'] += 1; st.rerun()
         with c_btn2:
-            if st.button("📍 점 다시찍기", use_container_width=True): st.session_state['points'] = []; st.rerun()
+            # [수정 2] 게이지바 대신 95도 회전 버튼으로 대체
+            if st.button("↩️ 95도 회전", use_container_width=True):
+                st.session_state['proc_img'] = working_img.rotate(95, expand=True)
+                st.session_state['points'] = []; st.rerun()
+        
+        if st.button("📍 점 다시찍기", use_container_width=True):
+            st.session_state['points'] = []; st.rerun()
 
     with col_pad:
         d_img = working_img.resize((int(w*scale), int(h*scale)), Image.Resampling.LANCZOS)
@@ -190,6 +152,7 @@ if uploaded:
             draw.text((px+12, py-12), str(i+1), fill='red')
         if len(st.session_state['points']) == 4:
             draw.polygon([tuple((p[0]*scale, p[1]*scale)) for p in st.session_state['points']], outline='#00FF00', width=3)
+        
         coords = streamlit_image_coordinates(d_img, key=f"deco_{st.session_state['refresh_count']}")
         if coords and len(st.session_state['points']) < 4:
             new_p = (coords['x']/scale, coords['y']/scale)
@@ -199,45 +162,43 @@ if uploaded:
     if len(st.session_state['points']) == 4:
         warped = four_point_transform(np.array(working_img), np.array(st.session_state['points'], dtype="float32"))
         final_img = Image.fromarray(warped)
-        final_img = apply_advanced_correction(final_img, angle, bri, con, shp, sat, temp, exp, hue)
         if "흑백" in s_mode: final_img = final_img.convert("L").convert("RGB")
         st.image(final_img, width=300, caption="분석 대상")
+        
         if st.button("🔍 Deco Finder 검색 시작", type="primary", use_container_width=True):
             with st.spinner('분석 중...'):
                 x_res = k_image.img_to_array(final_img.resize((224, 224))); q_res = res_model.predict(preprocess_input(np.expand_dims(x_res, axis=0)), verbose=0).flatten()
                 d_in = dino_transform(final_img).unsqueeze(0)
                 with torch.no_grad(): q_dino = dino_model(d_in).cpu().numpy().flatten()
+                
                 results = []
                 for fn, db_vec in feature_db.items():
                     score = (cosine_similarity([q_res], [db_vec[:2048]])[0][0] * 0.6) + (cosine_similarity([q_dino], [db_vec[2048:]])[0][0] * 0.4)
                     d_key = get_digits(fn); match_info = df_info[df_info['상품코드'].apply(get_digits) == d_key]
                     f_code = match_info.iloc[0]['상품코드'] if not match_info.empty else fn.split('.')[0]
-                    p_name = match_info.iloc[0]['상품명'] if not match_info.empty else ""
-                    f_key = str(f_code).strip().upper(); qty = agg_stock.get(f_key, 0)
+                    p_name = match_info.iloc[0]['상품명'] if not match_info.empty else ""; f_key = str(f_code).strip().upper(); qty = agg_stock.get(f_key, 0)
                     url_row = df_path[df_path['추출된_품번'].apply(get_digits) == d_key]; url = url_row['카카오톡_전송용_URL'].values[0] if not url_row.empty else None
                     if url: results.append({'formal': f_code, 'name': p_name, 'score': score, 'url': url, 'stock': qty})
+                
                 results.sort(key=lambda x: x['score'], reverse=True)
                 st.session_state['res_all'] = results[:15]; st.session_state['res_stock'] = [r for r in results if r['stock'] > 0][:15]
-                st.session_state['search_done'] = True; st.rerun()
+                gc.collect(); st.session_state['search_done'] = True; st.rerun()
 
-# --- [4] 결과 출력 (모바일 순환 정렬 수정) ---
+# --- [4] 결과 출력 (모바일 정렬 수정) ---
 if st.session_state.get('search_done') and st.session_state.get('res_all'):
     st.markdown("---")
-    tab1, tab2 = st.tabs(["📊 전체 결과", "✅ 재고 보유 (Top 15)"])
-
+    tab1, tab2 = st.tabs(["📊 전체 결과", "✅ 재고 보유"])
     def display_grid(items):
         if not items: st.warning("결과 없음"); return
-        
-        # [수정 4] 모바일에서 순위가 꼬이지 않도록 행(Row) 단위로 컬럼 생성
-        # 이 방식을 사용하면 모바일에서 1->2->3->4->5 순서로 세로 스크롤됩니다.
+        # [수정 4] 행 단위 출력으로 모바일 순위 고정
         for row_idx in range(0, len(items), 5):
             cols = st.columns(5)
             for col_idx in range(5):
-                item_idx = row_idx + col_idx
-                if item_idx < len(items):
-                    item = items[item_idx]
+                idx = row_idx + col_idx
+                if idx < len(items):
+                    item = items[idx]
                     with cols[col_idx]:
-                        st.markdown(f"**{item_idx+1}위: {item['formal']}**")
+                        st.markdown(f"**{idx+1}위: {item['formal']}**")
                         st.markdown(f"<div class='name-tag'>{item['name']}</div>", unsafe_allow_html=True)
                         if item['stock'] >= 100: st.markdown(f"<span class='stock-tag' style='color:#155724; background-color:#d4edda;'>보유: {item['stock']:,}m</span>", unsafe_allow_html=True)
                         elif item['stock'] > 0: st.markdown(f"<span class='stock-tag' style='color:#856404; background-color:#fff3cd;'>보유: {item['stock']:,}m</span>", unsafe_allow_html=True)
@@ -247,6 +208,5 @@ if st.session_state.get('search_done') and st.session_state.get('res_all'):
                             b64 = get_image_as_base64(item['url'])
                             if b64: st.image(b64, use_container_width=True)
                             st.write(f"**품명:** {item['name']}")
-
     with tab1: display_grid(st.session_state['res_all'])
     with tab2: display_grid(st.session_state['res_stock'])
