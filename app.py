@@ -49,7 +49,6 @@ def get_digits(text):
 
 @st.cache_resource
 def init_resources():
-    # 하이브리드 엔진 로드 (ResNet60%+DINO40%)
     model_res = ResNet50(weights='imagenet', include_top=False, pooling='avg')
     model_dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
     model_dino.eval()
@@ -63,7 +62,6 @@ def init_resources():
     
     agg_stock, stock_date = {}, "확인불가"
     if not df_stock.empty:
-        # [v2.6 이식] 정밀 재고 로직 유지
         df_stock['재고수량'] = pd.to_numeric(df_stock['재고수량'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
         df_stock['품번_KEY'] = df_stock['품번'].astype(str).str.strip().str.upper()
         agg_stock = df_stock.groupby('품번_KEY')['재고수량'].sum().to_dict()
@@ -91,7 +89,7 @@ def get_master_map():
 
 master_map = get_master_map()
 
-# --- [2] 이미지 처리 엔진 (기능 유지) ---
+# --- [2] 이미지 처리 엔진 ---
 def apply_advanced_correction(img, angle, bri, con, shp, sat, temp, exp, hue):
     if angle != 0: img = img.rotate(angle, expand=True)
     img = ImageEnhance.Brightness(img).enhance(bri)
@@ -120,7 +118,7 @@ def four_point_transform(image, pts):
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (w, h), flags=cv2.INTER_LANCZOS4)
 
-# --- [3] Deco Finder v3.7 UI ---
+# --- [3] Deco Finder v3.8 UI ---
 st.set_page_config(layout="wide", page_title="Deco Finder - Schattdecor")
 
 st.markdown("""
@@ -130,11 +128,17 @@ st.markdown("""
     .stExpander { border: 1px solid #B67741; border-radius: 5px; background-color: white; }
     h1 { color: #B67741; font-family: 'Arial Black', sans-serif; margin-bottom: 0px; }
     .stock-tag { font-weight: bold; padding: 2px 8px; border-radius: 4px; font-size: 0.9rem; margin-top: 5px; display: inline-block; }
+    .name-tag { font-size: 0.85rem; color: #666; margin-top: 2px; height: 1.2rem; overflow: hidden; }
     .guide-text { font-size: 0.95rem; color: #555; line-height: 1.6; }
     </style>
     """, unsafe_allow_html=True)
 
-# [수정 1] 로고와 제목 간격 축소 (1:15 비율)
+if 'res_all' not in st.session_state: st.session_state['res_all'] = []
+if 'res_stock' not in st.session_state: st.session_state['res_stock'] = []
+if 'points' not in st.session_state: st.session_state['points'] = []
+if 'search_done' not in st.session_state: st.session_state['search_done'] = False
+if 'refresh_count' not in st.session_state: st.session_state['refresh_count'] = 0
+
 col_logo, col_title = st.columns([1, 15])
 with col_logo:
     if os.path.exists("Logo.png"): st.image("Logo.png", width=120)
@@ -143,64 +147,55 @@ with col_title:
     st.title("Deco Finder")
     st.caption("Advanced Surface Pattern Matching & Inventory System")
 
-# [수정 2] 사이드바 전체 초기화 버튼 복구
 if st.sidebar.button("🔄 전체 초기화 (Reset All)", use_container_width=True):
-    st.session_state.clear()
+    for key in list(st.session_state.keys()): del st.session_state[key]
+    st.session_state.update({'res_all': [], 'res_stock': [], 'points': [], 'search_done': False, 'refresh_count': 0})
     st.rerun()
+
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"📦 **재고 정산 기준일:** \n{stock_date}")
 
-# [수정 5] 간략 사용 가이드 추가
 with st.expander("💡 사용 가이드 (Quick Start Guide)", expanded=False):
-    st.markdown("""
-    <div class='guide-text'>
-    1. <b>이미지 업로드</b>: 분석할 자재 사진을 선택하세요.<br>
-    2. <b>영역 지정</b>: 사진의 네 모서리를 순서대로 클릭하여 분석 범위를 잡으세요.<br>
-    3. <b>보정 및 검색</b>: 사진이 어둡거나 돌아갔다면 고급 옵션에서 조절 후 검색을 누르세요.<br>
-    4. <b>결과 확인</b>: 전체 결과 및 재고가 있는 자재를 탭별로 확인할 수 있습니다.
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown("<div class='guide-text'>1. 이미지 업로드 → 2. 네 꼭짓점 클릭(영역 지정) → 3. 필요 시 보정 → 4. 검색</div>", unsafe_allow_html=True)
 
-if 'points' not in st.session_state: st.session_state['points'] = []
-if 'search_done' not in st.session_state: st.session_state['search_done'] = False
-if 'refresh_count' not in st.session_state: st.session_state['refresh_count'] = 0
-
-uploaded = st.file_uploader("📷 자재 사진 업로드 (Upload Image)", type=['jpg','png','jpeg'])
+uploaded = st.file_uploader("📸 자재 사진 업로드 (Upload Image)", type=['jpg','png','jpeg'])
 
 if uploaded:
     if 'current_img_name' not in st.session_state or st.session_state['current_img_name'] != uploaded.name:
-        st.session_state.update({'points': [], 'search_done': False, 'current_img_name': uploaded.name, 'proc_img': Image.open(uploaded).convert('RGB')})
+        st.session_state.update({'points': [], 'search_done': False, 'res_all': [], 'res_stock': [], 'current_img_name': uploaded.name, 'proc_img': Image.open(uploaded).convert('RGB')})
         st.rerun()
 
     working_img = st.session_state['proc_img']
     w, h = working_img.size
 
-    # 고급 보정 (한글 메인)
+    # [수정 2] 회전 제어 고도화 (슬라이더 + 직접 입력)
     with st.expander("🛠️ 고급 이미지 보정 및 회전 (Advanced Settings)", expanded=False):
+        c_rot1, c_rot2 = st.columns([3, 1])
+        with c_rot1: 
+            angle = st.slider("사진 회전 (Rotation Gauge)", 0, 360, value=st.session_state.get('angle_val', 0))
+        with c_rot2: 
+            angle = st.number_input("각도 입력", 0, 360, value=angle, step=1)
+        st.session_state['angle_val'] = angle # 값 동기화
+
         c1, c2, c3 = st.columns(3)
         with c1:
-            angle = st.slider("사진 회전 (Rotation)", 0, 360, 0)
             bri = st.slider("밝기 (Brightness)", 0.5, 2.0, 1.0)
             con = st.slider("대비 (Contrast)", 0.5, 2.0, 1.0)
         with c2:
             sat = st.slider("채도 (Saturation)", 0.0, 2.0, 1.0)
             shp = st.slider("선명도 (Sharpness)", 0.0, 3.0, 1.5)
-            exp = st.slider("노출 (Exposure)", 0.5, 2.0, 1.0)
         with c3:
+            exp = st.slider("노출 (Exposure)", 0.5, 2.0, 1.0)
             temp = st.slider("색온도 (Color Temp)", 0.5, 1.5, 1.0)
             hue = st.slider("색조 (Hue Shift)", 0, 180, 0)
 
-    # 영역 지정 및 제어
     scale = st.radio("🔍 보기 크기 (View Scale):", [0.1, 0.3, 0.5, 0.7, 1.0], index=2, horizontal=True)
     
     col_ui, col_pad = st.columns([1, 2])
     with col_ui:
         source_type = st.radio("자재 출처", ['📸 실물 촬영', '💻 디지털 샘플'], horizontal=True)
         mat_type = st.selectbox("자재 분류", ['일반(Normal)', '우드(Wood)', '하이그로시(Glossy)', '패브릭(Texture)', '석재(Stone)'])
-        # [수정 4] 검색 모드 명칭 직관화
         s_mode = st.radio("분석 모드", ["종합(컬러+패턴) 검색", "패턴 중심(흑백) 검색"], horizontal=True)
-        
-        # [수정 3] 버튼 명칭 변경 및 이미지 새로고침 옆 배치
         c_btn1, c_btn2 = st.columns(2)
         with c_btn1:
             if st.button("🔄 이미지 새로고침", use_container_width=True): st.session_state['refresh_count'] += 1; st.rerun()
@@ -213,7 +208,7 @@ if uploaded:
         for i, p in enumerate(st.session_state['points']):
             px, py = p[0]*scale, p[1]*scale
             draw.ellipse((px-8, py-8, px+8, py+8), fill='#B67741', outline='white', width=2)
-            draw.text((px+12, py-12), str(i+1), fill='red', font_size=20)
+            draw.text((px+12, py-12), str(i+1), fill='red')
         if len(st.session_state['points']) == 4:
             draw.polygon([tuple((p[0]*scale, p[1]*scale)) for p in st.session_state['points']], outline='#00FF00', width=3)
 
@@ -229,10 +224,10 @@ if uploaded:
         final_img = apply_advanced_correction(final_img, angle, bri, con, shp, sat, temp, exp, hue)
         if "흑백" in s_mode: final_img = final_img.convert("L").convert("RGB")
         
-        st.image(final_img, width=300, caption="Deco Finder 분석 범위")
+        st.image(final_img, width=300, caption="Deco Finder 분석 대상")
         
         if st.button("🔍 Deco Finder 검색 시작 (Search)", type="primary", use_container_width=True):
-            with st.spinner('질감(60%)과 구조(40%)를 하이브리드 분석 중...'):
+            with st.spinner('AI 분석 중...'):
                 x_res = k_image.img_to_array(final_img.resize((224, 224)))
                 q_res = res_model.predict(preprocess_input(np.expand_dims(x_res, axis=0)), verbose=0).flatten()
                 d_in = dino_transform(final_img).unsqueeze(0)
@@ -243,47 +238,47 @@ if uploaded:
                     score = (cosine_similarity([q_res], [db_vec[:2048]])[0][0] * 0.6) + \
                             (cosine_similarity([q_dino], [db_vec[2048:]])[0][0] * 0.4)
                     d_key = get_digits(fn)
-                    info = master_map.get(d_key, {'formal': fn.split('.')[0], 'name': '정보 없음'})
-                    f_key = str(info['formal']).strip().upper()
+                    # [v2.6] 품번 매칭 및 품명 추출 (없으면 공란)
+                    match_info = df_info[df_info['상품코드'].apply(get_digits) == d_key]
+                    f_code = match_info.iloc[0]['상품코드'] if not match_info.empty else fn.split('.')[0]
+                    p_name = match_info.iloc[0]['상품명'] if not match_info.empty else ""
+                    
+                    f_key = str(f_code).strip().upper()
                     qty = agg_stock.get(f_key, 0)
                     url_row = df_path[df_path['추출된_품번'].apply(get_digits) == d_key]
                     url = url_row['카카오톡_전송용_URL'].values[0] if not url_row.empty else None
-                    if url: results.append({'formal': info['formal'], 'name': info['name'], 'score': score, 'url': url, 'stock': qty})
+                    if url: results.append({'formal': f_code, 'name': p_name, 'score': score, 'url': url, 'stock': qty})
 
                 results.sort(key=lambda x: x['score'], reverse=True)
                 st.session_state['res_all'] = results[:15]
-                # [수정 6] 재고 보유분 중에서 상위 15개 별도 추출
                 st.session_state['res_stock'] = [r for r in results if r['stock'] > 0][:15]
                 st.session_state['search_done'] = True; st.rerun()
 
-# --- [4] 결과 리스트 (탭 & 정보 선노출 강화) ---
-if st.session_state.get('search_done'):
+# --- [4] 결과 출력 (품번+품명 동시 노출) ---
+if st.session_state.get('search_done') and st.session_state.get('res_all'):
     st.markdown("---")
-    tab1, tab2 = st.tabs(["📊 전체 검색 결과 (Total)", "✅ 재고 보유 자재 (In-Stock Top 15)"])
+    tab1, tab2 = st.tabs(["📊 전체 검색 결과", "✅ 재고 보유 자재 (Top 15)"])
 
     def display_grid(items):
-        if not items:
-            st.warning("해당 조건의 자재가 없습니다.")
-            return
+        if not items: st.warning("결과 없음"); return
         cols = st.columns(5)
         for i, item in enumerate(items):
             with cols[i % 5]:
+                # 1. 품번 및 품명 동시 노출
                 st.markdown(f"**{i+1}위: {item['formal']}**")
+                st.markdown(f"<div class='name-tag'>{item['name']}</div>", unsafe_allow_html=True)
                 
-                # [수정 6] 펼치기 전 재고 정보 선노출
-                if item['stock'] >= 100:
-                    st.markdown(f"<span class='stock-tag' style='color:#155724; background-color:#d4edda;'>보유: {item['stock']:,}m</span>", unsafe_allow_html=True)
-                elif item['stock'] > 0:
-                    st.markdown(f"<span class='stock-tag' style='color:#856404; background-color:#fff3cd;'>보유: {item['stock']:,}m</span>", unsafe_allow_html=True)
-                else:
-                    st.markdown(f"<span class='stock-tag' style='color:#721c24; background-color:#f8d7da;'>재고 없음</span>", unsafe_allow_html=True)
+                # 2. 재고 정보 노출
+                if item['stock'] >= 100: st.markdown(f"<span class='stock-tag' style='color:#155724; background-color:#d4edda;'>보유: {item['stock']:,}m</span>", unsafe_allow_html=True)
+                elif item['stock'] > 0: st.markdown(f"<span class='stock-tag' style='color:#856404; background-color:#fff3cd;'>보유: {item['stock']:,}m</span>", unsafe_allow_html=True)
+                else: st.markdown(f"<span class='stock-tag' style='color:#721c24; background-color:#f8d7da;'>재고 없음</span>", unsafe_allow_html=True)
                 
                 st.caption(f"유사도: {item['score']:.1%}")
-                
                 with st.expander("🖼️ 이미지/상세보기", expanded=False):
                     b64 = get_image_as_base64(item['url'])
                     if b64: st.image(b64, use_container_width=True)
-                    st.write(f"**품명:** {item['name']}")
+                    st.write(f"**공식품번:** {item['formal']}")
+                    st.write(f"**상품명:** {item['name']}")
 
     with tab1: display_grid(st.session_state['res_all'])
     with tab2: display_grid(st.session_state['res_stock'])
