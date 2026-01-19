@@ -34,10 +34,18 @@ def get_direct_url(url):
 @st.cache_data(ttl=3600)
 def get_image_as_base64(url):
     try:
-        r = requests.get(get_direct_url(url), timeout=10)
-        img_str = base64.b64encode(r.content).decode()
+        # [수정] TIF 지원을 위해 원본을 Pillow로 열어 PNG로 재포장하는 로직 적용
+        r = requests.get(get_direct_url(url), timeout=15)
+        img = Image.open(BytesIO(r.content))
+        
+        buffered = BytesIO()
+        # RGB 모드로 변환하여 TIF 특유의 채널 문제를 방지한 후 PNG 저장
+        img.convert("RGB").save(buffered, format="PNG")
+        
+        img_str = base64.b64encode(buffered.getvalue()).decode()
         return f"data:image/png;base64,{img_str}"
-    except: return None
+    except Exception:
+        return None
 
 def load_csv_smart(target_name):
     files = os.listdir('.')
@@ -109,7 +117,7 @@ def four_point_transform(image, pts):
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (w, h), flags=cv2.INTER_LANCZOS4)
 
-# --- [3] Deco Finder v3.9.8 UI ---
+# --- [3] Deco Finder v3.9.9 UI ---
 st.set_page_config(layout="wide", page_title="Deco Finder")
 
 st.markdown("""
@@ -225,7 +233,6 @@ if uploaded:
                 
                 raw_results.sort(key=lambda x: x['score'], reverse=True)
                 
-                # [수정] 품번 중복 제거 로직 (동일 품번 사진 중 최고 점수 하나만 선택)
                 seen_all, seen_stock = set(), set()
                 all_r, stock_r = [], []
                 for item in raw_results:
