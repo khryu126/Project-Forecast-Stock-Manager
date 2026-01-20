@@ -23,7 +23,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 # [0] 환경 설정 및 토치 허브 버그 패치
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# --- [1] 리소스 로드 ---
+# --- [1] 리소스 로드 및 유틸리티 ---
 def get_direct_url(url):
     if not url or str(url) == 'nan' or 'drive.google.com' not in url: return url
     if 'file/d/' in url: file_id = url.split('file/d/')[1].split('/')[0]
@@ -34,14 +34,10 @@ def get_direct_url(url):
 @st.cache_data(ttl=3600)
 def get_image_as_base64(url):
     try:
-        # [수정] TIF 지원을 위해 원본을 Pillow로 열어 PNG로 재포장하는 로직 적용
         r = requests.get(get_direct_url(url), timeout=15)
         img = Image.open(BytesIO(r.content))
-        
         buffered = BytesIO()
-        # RGB 모드로 변환하여 TIF 특유의 채널 문제를 방지한 후 PNG 저장
         img.convert("RGB").save(buffered, format="PNG")
-        
         img_str = base64.b64encode(buffered.getvalue()).decode()
         return f"data:image/png;base64,{img_str}"
     except Exception:
@@ -68,15 +64,32 @@ def init_resources():
     except:
         model_dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
     model_dino.eval()
+    
     with open('material_features.pkl', 'rb') as f:
         feature_db = pickle.load(f)
-    df_path = load_csv_smart('이미지경로.csv'); df_info = load_csv_smart('품목정보.csv'); df_stock = load_csv_smart('현재고.csv')
+        
+    df_path = load_csv_smart('이미지경로.csv')
+    df_info = load_csv_smart('품목정보.csv')
+    df_stock = load_csv_smart('현재고.csv')
+    
     agg_stock, stock_date = {}, "확인불가"
     if not df_stock.empty:
         df_stock['재고수량'] = pd.to_numeric(df_stock['재고수량'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
         df_stock['품번_KEY'] = df_stock['품번'].astype(str).str.strip().str.upper()
         agg_stock = df_stock.groupby('품번_KEY')['재고수량'].sum().to_dict()
-        if '정산일자' in df_stock.columns: stock_date = str(int(df_stock['정산일자'].max()))
+        
+        # [날짜 로직 강화] 빈 칸 무시하고 숫자/문자열 날짜 모두 대응
+        if '정산일자' in df_stock.columns:
+            valid_dates = df_stock['정산일자'].dropna()
+            if not valid_dates.empty:
+                raw_val = valid_dates.iloc[0] # 첫 번째 데이터 우선 사용
+                try:
+                    # 숫자 형태(예: 20241031.0)면 정수형으로 깔끔하게 변환
+                    stock_date = str(int(float(raw_val)))
+                except:
+                    # '2026-01-19' 같은 문자열이면 그대로 사용
+                    stock_date = str(raw_val)
+            
     return model_res, model_dino, feature_db, df_path, df_info, agg_stock, stock_date
 
 res_model, dino_model, feature_db, df_path, df_info, agg_stock, stock_date = init_resources()
@@ -86,7 +99,7 @@ dino_transform = T.Compose([
     T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# --- [2] 이미지 처리 엔진 ---
+# --- [2] 이미지 처리 엔진 (동일) ---
 def apply_advanced_correction(img, state):
     img = ImageEnhance.Brightness(img).enhance(state['bri'])
     img = ImageEnhance.Contrast(img).enhance(state['con'])
@@ -117,7 +130,7 @@ def four_point_transform(image, pts):
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (w, h), flags=cv2.INTER_LANCZOS4)
 
-# --- [3] Deco Finder v3.9.9 UI ---
+# --- [3] UI (동일) ---
 st.set_page_config(layout="wide", page_title="Deco Finder")
 
 st.markdown("""
@@ -173,7 +186,8 @@ if uploaded:
     col_ui, col_pad = st.columns([1, 2])
     with col_ui:
         source_type = st.radio("출처", ['📸 촬영', '💻 디지털'], horizontal=True)
-        mat_type = st.selectbox("분류", ['일반', '우드', '유광', '패브릭', '석재'])
+        mat_type = st.selectbox("분류 (선택 시 자동 보정)", ['일반', '우드', '유광', '패브릭', '석재'])
+        
         if mat_type != st.session_state['last_mat']:
             st.session_state['last_mat'] = mat_type
             if mat_type == '우드': st.session_state['adj_state'].update({'con': 1.2, 'shp': 1.5})
@@ -182,10 +196,12 @@ if uploaded:
             elif mat_type == '패브릭': st.session_state['adj_state'].update({'con': 1.3})
             else: st.session_state['adj_state'] = {'bri': 1.0, 'con': 1.0, 'shp': 1.0, 'sat': 1.0, 'exp': 1.0, 'temp': 1.0, 'hue': 0}
             st.rerun()
+            
         s_mode = st.radio("분석 모드", ["종합(컬러+패턴)", "패턴 중심(흑백)"], horizontal=True)
         c_btn1, c_btn2 = st.columns(2)
         with c_btn1:
-            if st.button("🔄 새로고침", use_container_width=True): st.session_state['refresh_count'] = time.time(); st.rerun()
+            if st.button("🔄 새로고침", use_container_width=True): 
+                st.session_state['refresh_count'] = time.time(); st.rerun()
         with c_btn2:
             if st.button("↪️ 90도 회전", use_container_width=True):
                 st.session_state['proc_img'] = working_img.transpose(Image.ROTATE_270)
@@ -215,7 +231,6 @@ if uploaded:
         final_img = apply_advanced_correction(final_img, st.session_state['adj_state'])
         if "흑백" in s_mode: final_img = final_img.convert("L").convert("RGB")
         st.image(final_img, width=300, caption="분석 대상")
-        
         if st.button("🔍 Deco Finder 검색 시작", type="primary", use_container_width=True):
             with st.spinner('분석 중...'):
                 x_res = k_image.img_to_array(final_img.resize((224, 224))); q_res = res_model.predict(preprocess_input(np.expand_dims(x_res, axis=0)), verbose=0).flatten()
@@ -232,7 +247,6 @@ if uploaded:
                     if url: raw_results.append({'formal': f_code, 'name': p_name, 'score': score, 'url': url, 'stock': qty})
                 
                 raw_results.sort(key=lambda x: x['score'], reverse=True)
-                
                 seen_all, seen_stock = set(), set()
                 all_r, stock_r = [], []
                 for item in raw_results:
