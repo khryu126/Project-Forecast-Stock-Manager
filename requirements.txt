@@ -1,5 +1,6 @@
+# 수정된 requirements.txt
 pandas
-streamlit
+streamlit>=1.35.0
 rapidfuzz
 google-generativeai
 openpyxl
