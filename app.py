@@ -9,7 +9,7 @@ from dateutil.relativedelta import relativedelta
 # ==================================================
 st.set_page_config(page_title="Project Forecast Stock Manager", layout="wide")
 st.title("📊 Project Forecast Stock Manager")
-st.caption("성지라미텍 특판 모양지 통합 재고 관리 시스템 (V7)")
+st.caption("성지라미텍 특판 모양지 통합 재고 관리 시스템 (V7.1)")
 
 # ==================================================
 # [안전 장치] 유틸리티 함수
@@ -20,6 +20,7 @@ def to_num_series(series):
     return pd.to_numeric(s, errors="coerce").fillna(0.0)
 
 def safe_int_cast(val):
+    """NaN, Inf, None 등을 체크하여 안전하게 정수로 변환"""
     try:
         if pd.isna(val) or np.isinf(val): return 0
         return int(round(float(val)))
@@ -75,13 +76,13 @@ period_type = st.sidebar.selectbox("예측 단위", ["월별", "분기별"])
 period_count = st.sidebar.slider("예측 기간", 4, 12, 6)
 
 # ==================================================
-# 전처리 및 계산 (소요량 0 에러 해결)
+# 전처리 및 계산
 # ==================================================
 order = data_map["order"]
 item_col = '상품코드' if '상품코드' in order.columns else '품번'
 order['수주잔량_n'] = to_num_series(order['수주잔량'])
 
-# 날짜 변환 (yyyyMMdd 혹은 다른 형식 모두 대응)
+# 날짜 변환 로직
 order['납기일'] = pd.to_datetime(order['납품예정일'].astype(str), format='%Y%m%d', errors='coerce')
 if order['납기일'].isna().all():
     order['납기일'] = pd.to_datetime(order['납품예정일'].astype(str), errors='coerce')
@@ -94,7 +95,7 @@ po_df = data_map.get("po")
 info_df = data_map.get("item_info")
 market_df = data_map.get("market")
 
-# 기간 헤더
+# 기간 헤더 생성
 periods = []
 for i in range(period_count):
     if period_type == "월별":
@@ -136,9 +137,23 @@ for code in target_items:
             po_kg = to_num_series(po_df[po_df[p_item_col].astype(str).str.strip() == code][p_qty_col]).sum()
             po_stock_m = (po_kg * 1000) / (bw * 1.26)
 
-    # 행 생성 (유 대리님 요청: 행넘버 통합 및 재고 열 추가)
-    row_dem = {"No.": row_no, "품번": code, "상품명": display_name, "본사재고": int(hq_stock), "PO재고": int(po_stock_m), "구분": "소요량(m)"}
-    row_inv = {"No.": row_no, "품번": "", "상품명": "", "본사재고": "", "PO재고": "", "구분": "예상재고(m)"}
+    # [에러 수정 지점] safe_int_cast를 적용하여 NaN/Inf 오류 원천 차단
+    row_dem = {
+        "No.": row_no, 
+        "품번": code, 
+        "상품명": display_name, 
+        "본사재고": safe_int_cast(hq_stock), 
+        "PO재고": safe_int_cast(po_stock_m), 
+        "구분": "소요량(m)"
+    }
+    row_inv = {
+        "No.": row_no, 
+        "품번": "", 
+        "상품명": "", 
+        "본사재고": "", 
+        "PO재고": "", 
+        "구분": "예상재고(m)"
+    }
     
     current_running_balance = hq_stock + po_stock_m
     
@@ -161,7 +176,7 @@ for code in target_items:
     row_no += 1
 
 # ==================================================
-# 결과 출력 및 스타일링
+# 결과 출력
 # ==================================================
 if matrix_rows:
     final_df = pd.DataFrame(matrix_rows)
@@ -176,15 +191,15 @@ if matrix_rows:
     
     st.divider()
     
-    # --- 상세 내역 조회 (에러 방어 버전) ---
+    # --- 상세 내역 조회 ---
     st.subheader("🔍 품번별 수주 상세 내역")
     sel_item = st.selectbox("조회할 품번을 선택하세요", target_items)
     
     if sel_item:
         detail_view = order[order[item_col].astype(str).str.strip() == sel_item].copy()
-        # 존재하지 않는 컬럼이 있을 경우를 대비해 안전하게 필터링
         available_cols = [c for c in ['현장명', '건설사', '수주잔량_n', '납품예정일', '비고'] if c in detail_view.columns]
-        st.table(detail_view[available_cols].dropna(subset=[available_cols[0]]).sort_values('납품예정일'))
+        if not detail_view.empty:
+            st.table(detail_view[available_cols].dropna(subset=[available_cols[0]]).sort_values('납품예정일'))
 
     csv = final_df.to_csv(index=False).encode('utf-8-sig')
     st.download_button("📥 전체 결과 다운로드 (CSV)", csv, f"Inventory_Report_{datetime.now().strftime('%m%d')}.csv", "text/csv")
