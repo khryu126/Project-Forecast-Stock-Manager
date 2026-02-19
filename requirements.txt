@@ -1,11 +1,5 @@
-streamlit
-tensorflow-cpu
-torch
-torchvision
-pillow
-numpy
 pandas
-scikit-learn
-streamlit-image-coordinates
-opencv-python-headless
-requests
+streamlit
+rapidfuzz
+google-generativeai
+openpyxl
