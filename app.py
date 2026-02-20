@@ -16,7 +16,7 @@ LT_CONFIG = {
     'QZ': {'total': 2, 'ship_days': 30}
 }
 
-# --- [2. 유틸리티 함수] ---
+# --- [2. 지능형 유틸리티 함수] ---
 def clean_numeric(series):
     if series.dtype == 'object':
         series = series.astype(str).str.replace(',', '').str.replace('"', '').str.strip()
@@ -28,11 +28,23 @@ def parse_date_smart(series):
     return pd.to_datetime(s, format='%Y%m%d', errors='coerce')
 
 def smart_load_csv(file):
+    """헤더 행을 자동으로 찾아내어 로드하는 지능형 함수"""
+    # 인식용 핵심 키워드들
+    critical_keys = ["수주잔량", "총예상수량", "PO잔량", "미선적", "재고수량", "현재고", "상품코드", "최종생산지"]
+    
     for enc in ['cp949', 'utf-8-sig', 'utf-8']:
         try:
+            for skip in range(10): # 상단 10줄까지 헤더 탐색
+                file.seek(0)
+                df = pd.read_csv(file, encoding=enc, skiprows=skip)
+                # 컬럼 중 하나라도 핵심 키워드를 포함하고 있다면 해당 행이 헤더임
+                if any(any(key in str(col) for key in critical_keys) for col in df.columns):
+                    df = df.dropna(how='all', axis=0).dropna(how='all', axis=1)
+                    df.columns = [str(c).strip() for c in df.columns]
+                    return df
+            # 키워드를 못 찾았더라도 일단 로드 시도
             file.seek(0)
             df = pd.read_csv(file, encoding=enc)
-            df = df.dropna(how='all', axis=0).dropna(how='all', axis=1)
             return df
         except: continue
     return None
@@ -57,11 +69,11 @@ def show_detail_popup(group_ids, df_bl, cutoff_date):
     st.dataframe(detail.sort_values('dt_clean', ascending=True), use_container_width=True, hide_index=True)
 
 # --- [4. 메인 UI] ---
-st.title("🚀 P·Forecast Stock Manager v5.7")
+st.title("🚀 P·Forecast Stock Manager v5.8")
 
-# 파일 인식 사전 (상태 표시용)
+# 파일 인식 사전 (키워드 보강)
 RECOGNITION = {
-    "backlog": {"name": "수주예정(Demand)", "keys": ["수주잔량", "총예상수량"], "found": False},
+    "backlog": {"name": "수주예정(Demand)", "keys": ["수주잔량", "총예상수량", "잔량"], "found": False},
     "po": {"name": "구매발주(PO)", "keys": ["PO잔량", "미선적"], "found": False},
     "stock": {"name": "현재고(Stock)", "keys": ["재고수량", "현재고액"], "found": False},
     "item": {"name": "품목정보(Master)", "keys": ["최종생산지", "이전상품코드"], "found": False},
@@ -86,7 +98,6 @@ if uploaded_files:
     for f in uploaded_files:
         df = smart_load_csv(f)
         if df is not None:
-            df.columns = [str(c).strip() for c in df.columns]
             cols_text = "|".join(df.columns)
             for k, v in RECOGNITION.items():
                 if any(key in cols_text for key in v["keys"]):
@@ -94,13 +105,11 @@ if uploaded_files:
                     RECOGNITION[k]["found"] = True
                     break
 
-# 사이드바에 업로드 리스트 표시 (복구된 부분)
+# 사이드바 리스트 표시
 with st.sidebar:
     for k, v in RECOGNITION.items():
-        if v["found"]:
-            st.success(f"✅ {v['name']} (업로드 완료)")
-        else:
-            st.warning(f"⏳ {v['name']} (업로드 대기중)")
+        if v["found"]: st.success(f"✅ {v['name']} (완료)")
+        else: st.warning(f"⏳ {v['name']} (대기중)")
 
 # --- [5. 메인 분석 로직] ---
 if len(data) >= 5:
@@ -109,12 +118,13 @@ if len(data) >= 5:
         today_dt = pd.Timestamp(datetime.now().date())
         base_dt = pd.Timestamp(start_date_val)
 
+        # 컬럼 자동 검색
         it_code = find_col(df_item, ['상품코드', '품번'])
         it_site = find_col(df_item, ['최종생산지'])
         it_prev = find_col(df_item, ['이전상품코드'])
         
         bl_code = find_col(df_bl, ['상품코드', '품번'])
-        bl_qty = find_col(df_bl, ['수주잔량'])
+        bl_qty = find_col(df_bl, ['수주잔량', '잔량'])
         bl_date = find_col(df_bl, ['납품예정일'])
         
         po_code = find_col(df_po, ['품번', '상품코드'])
@@ -136,7 +146,7 @@ if len(data) >= 5:
 
         df_po['m_qty'] = clean_numeric(df_po[po_qty]) * 11.3378 
 
-        def get_arrival_v57(row):
+        def get_arrival_v58(row):
             pid = str(row[po_code]).strip()
             site_raw = str(row.get('생산지명', site_map.get(pid, 'ETC'))).upper()
             lt = LT_CONFIG.get(site_raw[:2], {'total': 0, 'ship_days': 0})
@@ -148,7 +158,7 @@ if len(data) >= 5:
                 if pd.isna(b_dt): b_dt = today_dt
                 return b_dt + relativedelta(months=int(lt['total']))
 
-        df_po['dt_arrival'] = df_po.apply(get_arrival_v57, axis=1)
+        df_po['dt_arrival'] = df_po.apply(get_arrival_v58, axis=1)
         df_st['clean_qty'] = clean_numeric(df_st[st_qty])
 
         freq_map = {"주별": "W", "월별": "MS", "분기별": "QS", "년도별": "YS"}
@@ -203,7 +213,7 @@ if len(data) >= 5:
         for c in num_cols: res_df[c] = pd.to_numeric(res_df[c], errors='coerce')
 
         def style_fn(row):
-            g_idx = (row.name // 3)
+            g_idx = (res_df.index.get_loc(row.name) // 3)
             bg = '#f9f9f9' if g_idx % 2 == 0 else '#ffffff'
             styles = [f'background-color: {bg}'] * len(row)
             for i, col in enumerate(row.index):
