@@ -7,10 +7,9 @@ from dateutil.relativedelta import relativedelta
 # --- [1. 설정 및 리드타임 마스터] ---
 st.set_page_config(page_title="P·Forecast Stock Manager", layout="wide")
 
-# 리드타임: SRL(폴란드) 포함 유럽 3개월, 아시아 1개월
 LT_CONFIG = {
     'SE': {'total': 6, 'ship_days': 90},
-    'SR': {'total': 8, 'ship_days': 90},  # SR(0) 등 대응을 위해 SR로 설정
+    'SR': {'total': 8, 'ship_days': 90},
     'SRL': {'total': 8, 'ship_days': 90},
     'SP': {'total': 8, 'ship_days': 90},
     'SH': {'total': 1, 'ship_days': 30},
@@ -18,10 +17,9 @@ LT_CONFIG = {
     'QZ': {'total': 2, 'ship_days': 30}
 }
 
-# --- [2. 지능형 유틸리티 함수] ---
+# --- [2. 유틸리티 함수] ---
 def clean_numeric(series):
     if series.dtype == 'object':
-        # 숫자, 마침표, 마이너스 기호 제외한 모든 문자 제거
         series = series.astype(str).str.replace(r'[^\d.-]', '', regex=True)
         series = series.replace(['', 'nan', 'None'], np.nan)
     return pd.to_numeric(series, errors='coerce').fillna(0)
@@ -31,7 +29,6 @@ def parse_date_smart(series):
     return pd.to_datetime(s, format='%Y%m%d', errors='coerce')
 
 def find_col(df, keywords, default_idx=None):
-    """키워드로 컬럼명을 찾되, 못 찾으면 기본 인덱스 반환 (안정성 핵심)"""
     for k in keywords:
         for col in df.columns:
             if k in str(col).replace(" ", "").upper():
@@ -41,12 +38,10 @@ def find_col(df, keywords, default_idx=None):
     return None
 
 def smart_load_csv(file):
-    """v5.3의 안정성 + 헤더 탐색 강화"""
     for enc in ['cp949', 'utf-8-sig', 'utf-8']:
         try:
             file.seek(0)
             df = pd.read_csv(file, encoding=enc)
-            # Unnamed가 많으면 헤더가 아래에 있다고 판단
             if df.columns.str.contains('Unnamed').sum() > len(df.columns) * 0.3:
                 for i in range(1, 20):
                     file.seek(0)
@@ -61,22 +56,21 @@ def smart_load_csv(file):
 @st.dialog("현장별 상세 수주 내역", width="large")
 def show_detail_popup(group_ids, df_bl, cutoff_date):
     st.write(f"🔎 분석 대상 품번 그룹: {', '.join(group_ids)}")
-    # 수주예정등록 상품코드(G열/index 5)
     code_col = find_col(df_bl, ['상품코드', '품번'], 5)
     qty_col = find_col(df_bl, ['수주잔량', '잔량'], 30)
-    
     group_upper = [g.upper() for g in group_ids]
     detail = df_bl[df_bl[code_col].astype(str).str.upper().str.strip().isin(group_upper)].copy()
     detail['clean_qty'] = clean_numeric(detail[qty_col])
-    detail = detail[(detail['clean_qty'] > 0) & (pd.to_datetime(detail.iloc[:, 24], errors='coerce') >= cutoff_date)]
-    
+    # 날짜 인덱스(24) 안전 파싱
+    detail['dt_clean_popup'] = pd.to_datetime(detail.iloc[:, 24].astype(str).str.replace('.0',''), format='%Y%m%d', errors='coerce')
+    detail = detail[(detail['clean_qty'] > 0) & (detail['dt_clean_popup'] >= cutoff_date)]
     if detail.empty:
         st.info("조건에 맞는 수주 데이터가 없습니다.")
         return
-    st.dataframe(detail.sort_values(detail.columns[24], ascending=True), use_container_width=True, hide_index=True)
+    st.dataframe(detail.sort_values('dt_clean_popup', ascending=True), use_container_width=True, hide_index=True)
 
-# --- [4. 메인 UI 및 파일 상태창] ---
-st.title("🚀 P·Forecast Stock Manager v6.2")
+# --- [4. 메인 UI] ---
+st.title("🚀 P·Forecast Stock Manager v6.3")
 
 RECOGNITION = {
     "backlog": {"name": "수주예정(Demand)", "keys": ["수주잔량", "총예상수량"], "found": False},
@@ -88,7 +82,8 @@ RECOGNITION = {
 
 with st.sidebar:
     st.header("⚙️ 분석 설정")
-    start_date_val = st.date_input("검토 시점(조회 시작일)", datetime.now().replace(day=1) + relativedelta(months=1))
+    default_start = (datetime.now().replace(day=1) + relativedelta(months=1))
+    start_date_val = st.date_input("검토 시점(조회 시작일)", default_start)
     freq_opt = st.selectbox("집계 단위", ["주별", "월별", "분기별", "년도별"], index=1)
     exclude_months = st.slider("과거 수주 제외 (N개월)", 1, 36, 12)
     cutoff_date = pd.Timestamp(start_date_val) - relativedelta(months=exclude_months)
@@ -117,73 +112,61 @@ with st.sidebar:
 
 # --- [5. 메인 분석 로직] ---
 if len(data) >= 5:
-    with st.spinner('정밀 데이터 맵핑 및 시뮬레이션 중...'):
+    with st.spinner('정밀 데이터 맵핑 중...'):
         df_item, df_bl, df_po, df_st, df_retail = data['item'], data['backlog'], data['po'], data['stock'], data['retail']
         today_dt = pd.Timestamp(datetime.now().date())
         base_dt = pd.Timestamp(start_date_val)
 
-        # 컬럼 매핑
         it_code = find_col(df_item, ['상품코드', '품번'], 6)
         it_site = find_col(df_item, ['최종생산지명', '생산지'], 12)
         it_prev = find_col(df_item, ['이전상품코드'], 13)
         it_name = find_col(df_item, ['상품명', '품명'], 1)
-
         po_code = find_col(df_po, ['품번', '상품코드'], 12)
         po_qty = find_col(df_po, ['PO잔량', '미선적'], 19)
         po_site = find_col(df_po, ['생산지명', '거래처'], 10)
         po_prod = find_col(df_po, ['생산예정일'], 28)
         po_date = find_col(df_po, ['PO일자', '발주일자'], 3)
-
         bl_code = find_col(df_bl, ['상품코드', '품번'], 5)
         bl_qty = find_col(df_bl, ['수주잔량', '총예상수량'], 30)
         bl_date = find_col(df_bl, ['납품예정일'], 24)
-
         st_code = find_col(df_st, ['품번', '상품코드'], 7)
         st_qty = find_col(df_st, ['재고수량', '현재고'], 17)
 
-        # 1. 마스터 정보 맵핑
         master_info = df_item.copy()
         master_info['key'] = master_info[it_code].astype(str).str.upper().str.strip()
         site_map = master_info.set_index('key')[it_site].to_dict()
         prev_map = master_info.set_index('key')[it_prev].to_dict()
         next_map = df_item.set_index(df_item[it_prev].astype(str).str.upper().str.strip())[it_code].to_dict()
 
-        # 2. 데이터 정제
         df_bl['clean_qty'] = clean_numeric(df_bl[bl_qty])
         df_bl['dt_clean'] = parse_date_smart(df_bl[bl_date])
         df_bl = df_bl[df_bl['dt_clean'] >= cutoff_date].copy()
-
         df_po['m_qty'] = clean_numeric(df_po[po_qty]) * 11.3378 
 
-        # [핵심] SRL(SR0) 인식 및 사각지대 물량 전진 배치 로직
-        def calc_arrival_v62(row):
-            pid_upper = str(row[po_code]).upper().strip()
-            # 1. 생산지명에서 SR 포함 여부 확인 (SRL 매칭용)
-            site_val = str(row.get(po_site, site_map.get(pid_upper, 'ETC'))).upper()
-            site_key = 'SRL' if 'SR' in site_val else site_val[:2]
+        def calc_arrival_v63(row):
+            pid_u = str(row[po_code]).upper().strip()
+            site_v = str(row.get(po_site, site_map.get(pid_u, 'ETC'))).upper()
+            site_k = 'SRL' if 'SR' in site_v else site_v[:2]
+            lt = LT_CONFIG.get(site_k, LT_CONFIG.get(site_v[:2], {'total': 1, 'ship_days': 30}))
             
-            lt_cfg = LT_CONFIG.get(site_key, LT_CONFIG.get(site_val[:2], {'total': 1, 'ship_days': 30}))
-            
-            prod_dt = parse_date_smart(pd.Series([row.get(po_prod, np.nan)]))[0]
-            if pd.notnull(prod_dt):
-                arrival = prod_dt + timedelta(days=int(lt_cfg['ship_days']))
+            p_dt = parse_date_smart(pd.Series([row.get(po_prod, np.nan)]))[0]
+            if pd.notnull(p_dt):
+                arrival = p_dt + pd.DateOffset(days=int(lt['ship_days']))
             else:
-                p_date = parse_date_smart(pd.Series([row.get(po_date, today_dt)]))[0]
-                arrival = p_date + relativedelta(months=int(lt_cfg['total']))
+                b_val = row.get(po_date)
+                b_dt = parse_date_smart(pd.Series([b_val]))[0]
+                if pd.isna(b_dt): b_dt = today_dt
+                arrival = b_dt + pd.DateOffset(months=int(lt['total']))
             
-            # [수정] Hold 물량 및 사각지대(Today~Base) 물량 ➔ 첫 분석달(Base)로 전진 배치
-            if arrival < base_dt:
-                # 오늘 기준으로 선적했을 때 가장 빨리 오는 날짜로 재계산
-                arrival = today_dt + timedelta(days=int(lt_cfg['ship_days']))
-                # 만약 재계산해도 base_dt 이전이면 최소 base_dt 당일로 맞춤 (첫 달 시각화 보장)
+            # 사각지대 전진 배치 (조회 시작일 이전 물량 -> 시작월 입고량)
+            if pd.isnull(arrival) or arrival < base_dt:
+                arrival = today_dt + pd.DateOffset(days=int(lt['ship_days']))
                 if arrival < base_dt: arrival = base_dt
-            
             return arrival
 
-        df_po['dt_arrival'] = df_po.apply(calc_arrival_v62, axis=1)
+        df_po['dt_arrival'] = df_po.apply(calc_arrival_v63, axis=1)
         df_st['clean_qty'] = clean_numeric(df_st[st_qty])
 
-        # 3. 타임라인 매트릭스 생성
         freq_map = {"주별": "W", "월별": "MS", "분기별": "QS", "년도별": "YS"}
         date_range = pd.date_range(start=base_dt, periods=13, freq=freq_map[freq_opt])
         time_labels = [d.strftime('%Y-%m-%d' if freq_opt=="주별" else '%Y-%m') for d in date_range[:12]]
@@ -193,32 +176,27 @@ if len(data) >= 5:
         idx_no = 1
 
         for pid in target_ids:
-            pid_s = str(pid).strip()
-            pid_u = pid_s.upper()
+            pid_s = str(pid).strip(); pid_u = pid_s.upper()
             item_match = df_item[df_item[it_code].astype(str).str.upper().str.strip() == pid_u]
             p_name = str(item_match[it_name].iloc[0]) if not item_match.empty else "-"
             if search_query and (search_query.lower() not in p_name.lower() and search_query.lower() not in pid_s.lower()): continue
 
-            # 품번 체인 (NAN 제거)
-            def clean_pid(val):
-                v = str(val).strip()
-                return v if v not in ["nan", "None", "0", "-", ""] else ""
-
-            p_id = clean_pid(prev_map.get(pid_u, ""))
-            n_id = clean_pid(next_map.get(pid_u, ""))
+            def clean_p(v):
+                s = str(v).strip()
+                return s if s not in ["nan", "None", "0", "-", ""] else ""
+            p_id = clean_p(prev_map.get(pid_u, "")); n_id = clean_p(next_map.get(pid_u, ""))
             group = list(set([pid_u, p_id, n_id])); group = [g for g in group if g]
 
             site_name = str(site_map.get(pid_u, "ETC"))
-            lt_total = LT_CONFIG.get('SRL' if 'SR' in site_name.upper() else site_name[:2].upper(), {'total': 0})['total']
+            site_key = 'SRL' if 'SR' in site_name.upper() else site_name[:2].upper()
+            lt_total = LT_CONFIG.get(site_key, {'total': 0})['total']
             is_retail = " 🏷️" if any(str(g).upper() in df_retail.iloc[:, 8].astype(str).str.upper().values for g in group) else ""
 
-            # 기초 재고 (순수 현재고만 반영, PO는 매트릭스에서 가산)
             main_stk = df_st[df_st[st_code].astype(str).str.upper().str.strip().isin(group)]['clean_qty'].sum()
-            
             overdue_dem = df_bl[(df_bl[bl_code].astype(str).str.upper().str.strip().isin(group)) & (df_bl['dt_clean'] < base_dt)]['clean_qty'].sum()
             running_inv = main_stk - overdue_dem
             
-            d_row = {"No": idx_no, "품명": p_name, "수주품번": pid_s + is_retail, "본사재고": main_stk, "PO잔량(m)": df_po[df_po[po_code].astype(str).str.upper().str.strip().isin(group)]['m_qty'].sum(), "생산지": f"{site_name[:2]}({lt_total}M)", "구분": "소요량", "연계정보": f"이전:{p_id}" if p_id else "", "납기경과": overdue_dem, "group": group}
+            d_row = {"No": idx_no, "품명": p_name, "수주품번": pid_s + is_retail, "본사재고": main_stk, "PO잔량(m)": df_po[df_po[po_code].astype(str).str.upper().str.strip().isin(group)]['m_qty'].sum(), "생산지": f"{site_key}({lt_total}M)", "구분": "소요량", "연계정보": f"이전:{p_id}" if p_id else "", "납기경과": overdue_dem, "group": group}
             p_row = {"No": idx_no, "품명": "", "수주품번": "", "본사재고": np.nan, "PO잔량(m)": np.nan, "생산지": "", "구분": "입고량(PO)", "연계정보": "", "납기경과": 0, "group": group}
             s_row = {"No": idx_no, "품명": "", "수주품번": "", "본사재고": np.nan, "PO잔량(m)": np.nan, "생산지": "", "구분": "예상재고", "연계정보": f"변경:{n_id}" if n_id else "", "납기경과": running_inv, "group": group}
 
@@ -228,10 +206,8 @@ if len(data) >= 5:
                 m_sup = df_po[(df_po[po_code].astype(str).str.upper().str.strip().isin(group)) & (df_po['dt_arrival'] >= start) & (df_po['dt_arrival'] < end)]['m_qty'].sum()
                 running_inv = (running_inv + m_sup) - m_dem
                 d_row[time_labels[i]], p_row[time_labels[i]], s_row[time_labels[i]] = m_dem, m_sup, running_inv
-                
-                if running_inv < 0 and start < base_dt + relativedelta(months=lt_total):
+                if running_inv < 0 and start < base_dt + pd.DateOffset(months=lt_total):
                     alert_list.append({"품명": p_name, "품번": pid_s, "부족시점": time_labels[i], "부족수량": abs(running_inv)})
-
             matrix_rows.extend([d_row, p_row, s_row]); idx_no += 1
 
     if matrix_rows:
@@ -240,8 +216,7 @@ if len(data) >= 5:
         for c in num_cols: res_df[c] = pd.to_numeric(res_df[c], errors='coerce')
 
         def style_fn(row):
-            g_idx = (row.name // 3)
-            bg = '#f9f9f9' if g_idx % 2 == 0 else '#ffffff'
+            g_idx = (row.name // 3); bg = '#f9f9f9' if g_idx % 2 == 0 else '#ffffff'
             styles = [f'background-color: {bg}'] * len(row)
             for i, col in enumerate(row.index):
                 if col == "구분": styles[i] = 'background-color: #e1f5fe; font-weight: bold'
@@ -249,21 +224,12 @@ if len(data) >= 5:
                     if row[col] < 0: styles[i] = 'background-color: #ff4b4b; color: white'
             return styles
 
-        if alert_list:
-            if st.button(f"⚠️ 긴급 발주 검토 대상 ({len(pd.DataFrame(alert_list)['품번'].unique())}건)"):
-                st.table(pd.DataFrame(alert_list).drop_duplicates(subset=['품번'], keep='first').style.format({"부족수량": "{:,.0f}"}))
-
         st.subheader(f"📊 통합 수급 분석 매트릭스 ({freq_opt})")
-        st_df = st.dataframe(
+        st.dataframe(
             res_df.style.apply(style_fn, axis=1).format({c: "{:,.0f}" for c in num_cols}, na_rep=""),
             use_container_width=True, hide_index=True,
             column_order=["No", "품명", "수주품번", "본사재고", "PO잔량(m)", "생산지", "연계정보", "구분", "납기경과"] + time_labels,
             on_select="rerun", selection_mode="single-row"
         )
-        if st_df.selection.rows:
-            s_idx = st_df.selection.rows[0]
-            target = res_df.iloc[s_idx - (s_idx % 3)]
-            if st.button(f"🔍 {str(target['수주품번']).replace('🏷️','').strip()} 상세 보기"):
-                show_detail_popup(target['group'], df_bl, cutoff_date)
 else:
     st.info("사이드바에 5종 파일을 모두 업로드해주세요.")
